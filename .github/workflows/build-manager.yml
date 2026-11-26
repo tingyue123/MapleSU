@@ -92,8 +92,6 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python tools/prepare_native_inputs.py --check
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          python scripts/sync-ultra-sdk-identity.py --check
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           python tools/build_module_policy.py --prepare-only --offline
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Fetch locked extractor dependencies
@@ -102,6 +100,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build SDK and consumer
         run: ./gradlew.bat :maplesu-client:assembleRelease :maplesu-consumer:assembleDebug --no-daemon --no-build-cache --no-configuration-cache --max-workers=2
+      - name: Verify Ultra SDK identity
+        run: |
+          python scripts/sync-ultra-sdk-identity.py --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build debug Manager
         if: inputs.variant != 'release'
         env:
