@@ -1,0 +1,152 @@
+name: Build Manager
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: Build variant
+        type: choice
+        options:
+          - debug
+          - release
+        default: debug
+        required: true
+  pull_request:
+    paths:
+      - '.github/workflows/build-manager.yml'
+      - 'manager/**'
+      - 'client/**'
+      - 'image-core/**'
+      - 'installer-core/**'
+      - 'runtime/**'
+      - 'patch-engine/**'
+      - 'jailbreak-providers/**'
+      - 'module-policy/**'
+      - 'module-tools/**'
+      - 'third_party/**'
+      - 'tools/**'
+      - 'gradle/**'
+      - '*.gradle.kts'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manager-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  manager:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - name: Check release branch
+        if: inputs.variant == 'release'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          SELECTED_BRANCH: ${{ github.ref_name }}
+        run: |
+          if ($env:SELECTED_BRANCH -ne $env:DEFAULT_BRANCH) {
+            throw 'Signed release builds must run from the default branch.'
+          }
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Set up MinGW
+        id: msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+      - name: Install build inputs
+        run: |
+          & "$env:ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat" 'cmdline-tools;latest'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & "$env:ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager.bat" 'platforms;android-37.0' 'build-tools;37.0.0' 'cmake;3.22.1' 'ndk;26.1.10909125' 'ndk;28.2.13676358' 'ndk;29.0.14206865'
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          rustup toolchain install 1.99.1-x86_64-pc-windows-gnu --profile minimal --target aarch64-linux-android
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m pip install -r requirements-native.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "MAPLESU_PYTHON=$((Get-Command python).Source)" >> $env:GITHUB_ENV
+          "ANDROID_SDK_ROOT=$env:ANDROID_HOME" >> $env:GITHUB_ENV
+      - name: Verify retained native inputs
+        run: |
+          if (Test-Path .handoff/source-files.json) {
+            python .handoff/source_snapshot.py verify --repair
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          python tools/check_source_export.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python jailbreak-providers/ghostlock/build_extractor.py --verify-only
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/prepare_native_inputs.py --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/build_module_policy.py --prepare-only --offline
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Fetch locked extractor dependencies
+        run: |
+          cargo +1.99.1-x86_64-pc-windows-gnu fetch --locked --target aarch64-linux-android --manifest-path jailbreak-providers/ghostlock/extractor-native/Cargo.toml
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build SDK and consumer
+        run: ./gradlew.bat :maplesu-client:assembleRelease :maplesu-consumer:assembleDebug --no-daemon --no-build-cache --no-configuration-cache --max-workers=2
+      - name: Verify Ultra SDK identity
+        run: |
+          python scripts/sync-ultra-sdk-identity.py --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build debug Manager
+        if: inputs.variant != 'release'
+        env:
+          MINGW_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: ./gradlew.bat :manager:assembleDebug --no-daemon --no-build-cache --no-configuration-cache --max-workers=2 '-PmaplesuRustToolchain=1.99.1-x86_64-pc-windows-gnu' "-PmaplesuMingwBin=$env:MINGW_ROOT/ucrt64/bin"
+      - name: Build signed Manager
+        if: github.event_name == 'workflow_dispatch' && inputs.variant == 'release'
+        env:
+          KEYSTORE: ${{ secrets.KEYSTORE }}
+          MAPLE_RELEASE_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          MAPLE_RELEASE_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          MAPLE_RELEASE_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          MINGW_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:KEYSTORE) -or [string]::IsNullOrWhiteSpace($env:MAPLE_RELEASE_STORE_PASSWORD) -or [string]::IsNullOrWhiteSpace($env:MAPLE_RELEASE_KEY_ALIAS) -or [string]::IsNullOrWhiteSpace($env:MAPLE_RELEASE_KEY_PASSWORD)) {
+            throw 'Configure KEYSTORE, KEYSTORE_PASSWORD, KEY_ALIAS and KEY_PASSWORD in Actions Secrets.'
+          }
+          $env:MAPLE_RELEASE_STORE_FILE = Join-Path $env:RUNNER_TEMP 'maplesu-release.jks'
+          try {
+            [IO.File]::WriteAllBytes($env:MAPLE_RELEASE_STORE_FILE, [Convert]::FromBase64String($env:KEYSTORE))
+            ./gradlew.bat :manager:assembleRelease --no-daemon --no-build-cache --no-configuration-cache --max-workers=2 '-PmaplesuRustToolchain=1.99.1-x86_64-pc-windows-gnu' "-PmaplesuMingwBin=$env:MINGW_ROOT/ucrt64/bin"
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          } finally {
+            Remove-Item -LiteralPath $env:MAPLE_RELEASE_STORE_FILE -Force -ErrorAction SilentlyContinue
+          }
+      - name: Upload native build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: MapleSU-native-diagnostics-${{ github.sha }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: |
+            manager/build/jailbreakProviders/**/build.json
+            manager/build/jailbreakProviders/**/build.log
+            manager/build/jailbreakProviders/**/verify-build.txt
+      - name: Upload build outputs
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: MapleSU-${{ inputs.variant || 'debug' }}-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            manager/build/outputs/apk/**/*.apk
+            manager/build/outputs/mapping/release/mapping.txt
+            client/build/outputs/aar/*.aar
+            consumer/build/outputs/apk/**/*.apk
